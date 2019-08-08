@@ -1,376 +1,234 @@
-from __future__ import absolute_import, division, print_function
-from builtins import range
-from collections import OrderedDict
-import os
-import _model.model
-import numpy as np
-import tensorflow as tf
-import random
-import time
-import json
-from _model.gen_dataloader import Gen_Data_loader
-from _model.dis_dataloader import Dis_dataloader
-from _model.text_CNN import TextCNN
-from _model.rollout_policy import ROLLOUT
-from lstm import TARGET_LSTM
-# import io_utils
-import pandas as pd
-import _model.mol_metrics
-import sys
-from tqdm import tqdm
+import boto3, re
+from sagemaker import get_execution_role
+role = get_execution_role
+print (" role ")
+from sagemaker.tensorflow import tensorflow as tf
+from tensorflow.python.ops import tensor_array_ops, control_flow_ops
 
+from tensorflow.contrib import legacy_seq2seq
 
-if len(sys.argv) == 2:
-    PARAM_FILE = sys.argv[1]
-else:
-    PARAM_FILE = '_model/hyperparams.json'
-params = json.loads(open(PARAM_FILE).read(), object_pairs_hook=OrderedDict)
-##########################################################################
-#  Training  Hyper-parameters
-##########################################################################
+class LSTM(object):
+    def __init__(self, num_emb, batch_size, emb_dim, hidden_dim,
+                 sequence_length, start_token,
+                 learning_rate=0.01, reward_gamma=0.95):
+        self.num_emb = num_emb
+        self.batch_size = batch_size
+        self.emb_dim = emb_dim
+        self.hidden_dim = hidden_dim
+        self.sequence_length = sequence_length
+        self.start_token = tf.constant([start_token] * self.batch_size, dtype=tf.int32)
+        self.learning_rate = tf.Variable(float(learning_rate), trainable=False)
+        self.reward_gamma = reward_gamma
+        self.g_params = []
+        self.d_params = []
+        self.temperature = 1.0
+        self.grad_clip = 5.0
 
-# Load metrics file
-if params['METRICS_FILE'] == 'mol_metrics':
-    mm = mol_metrics
-elif params['METRICS_FILE'] == 'music_metrics':
-    mm = music_metrics
-else:
-    raise ValueError('Metrics file unknown!')
+        self.expected_reward = tf.Variable(tf.zeros([self.sequence_length]))
 
-PREFIX = params['EXP_NAME']
-PRE_EPOCH_NUM = params['G_PRETRAIN_STEPS']
-TRAIN_ITER = params['G_STEPS']  # generator
-SEED = params['SEED']
-BATCH_SIZE = params["BATCH_SIZE"]
-TOTAL_BATCH = params['TOTAL_BATCH']
-dis_batch_size = 64
-dis_num_epochs = 3
-dis_alter_epoch = params['D_PRETRAIN_STEPS']
+        with tf.variable_scope('generator'):
+            self.g_embeddings = tf.Variable(self.init_matrix([self.num_emb, self.emb_dim]))
+            self.g_params.append(self.g_embeddings)
+            self.g_recurrent_unit = self.create_recurrent_unit(self.g_params)  # maps h_tm1 to h_t for generator
+            self.g_output_unit = self.create_output_unit(self.g_params)  # maps h_t to o_t (output token logits)
 
-##########################################################################
-#  Generator  Hyper-parameters
-##########################################################################
-EMB_DIM = 32
-HIDDEN_DIM = 32
-START_TOKEN = 0
-SAMPLE_NUM = 6400
-BIG_SAMPLE_NUM = SAMPLE_NUM * 5
-D_WEIGHT = params['D_WEIGHT']
+        # placeholder definition
+        self.x = tf.placeholder(tf.int32, shape=[self.batch_size, self.sequence_length])
+        # sequence of indices of true data, not including start token
 
-D = max(int(5 * D_WEIGHT), 1)
-##########################################################################
+        self.rewards = tf.placeholder(tf.float32, shape=[self.batch_size, self.sequence_length])
+        # get from rollout policy and discriminator
 
+        # processed for batch
+        with tf.device("/cpu:0"):
+            inputs = tf.split(axis=1, num_or_size_splits=self.sequence_length, value=tf.nn.embedding_lookup(self.g_embeddings, self.x))
+            self.processed_x = tf.stack(
+                [tf.squeeze(input_, [1]) for input_ in inputs])  # seq_length x batch_size x emb_dim
 
-##########################################################################
-#  Discriminator  Hyper-parameters
-##########################################################################
-dis_embedding_dim = 64
-dis_filter_sizes = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 20]
-dis_num_filters = [100, 200, 200, 200, 200, 100, 100, 100, 100, 100, 160, 160]
-dis_dropout_keep_prob = 0.75
-dis_l2_reg_lambda = 0.2
+        self.h0 = tf.zeros([self.batch_size, self.hidden_dim])
+        self.h0 = tf.stack([self.h0, self.h0])
 
-#============= Objective ==============
+        gen_o = tensor_array_ops.TensorArray(dtype=tf.float32, size=self.sequence_length,
+                                             dynamic_size=False, infer_shape=True)
+        gen_x = tensor_array_ops.TensorArray(dtype=tf.int32, size=self.sequence_length,
+                                             dynamic_size=False, infer_shape=True)
 
-reward_func = mm.load_reward(params['OBJECTIVE'])
+        def _g_recurrence(i, x_t, h_tm1, gen_o, gen_x):
+            h_t = self.g_recurrent_unit(x_t, h_tm1)  # hidden_memory_tuple
+            o_t = self.g_output_unit(h_t)  # batch x vocab , logits not prob
+            log_prob = tf.log(tf.nn.softmax(o_t))
+            next_token = tf.cast(tf.reshape(tf.multinomial(log_prob, 1), [self.batch_size]), tf.int32)
+            x_tp1 = tf.nn.embedding_lookup(self.g_embeddings, next_token)  # batch x emb_dim
+            gen_o = gen_o.write(i, tf.reduce_sum(tf.multiply(tf.one_hot(next_token, self.num_emb, 1.0, 0.0),
+                                                        tf.nn.softmax(o_t)), 1))  # [batch_size] , prob
+            gen_x = gen_x.write(i, next_token)  # indices, batch_size
+            return i + 1, x_tp1, h_t, gen_o, gen_x
 
+        _, _, _, self.gen_o, self.gen_x = control_flow_ops.while_loop(
+            cond=lambda i, _1, _2, _3, _4: i < self.sequence_length,
+            body=_g_recurrence,
+            loop_vars=(tf.constant(0, dtype=tf.int32),
+                       tf.nn.embedding_lookup(self.g_embeddings, self.start_token), self.h0, gen_o, gen_x))
 
-def make_reward(train_samples):
+        self.gen_x = self.gen_x.stack()  # seq_length x batch_size
+        self.gen_x = tf.transpose(self.gen_x, perm=[1, 0])  # batch_size x seq_length
 
-    def batch_reward(samples):
-        decoded = [mm.decode(sample, ord_dict) for sample in samples]
-        pct_unique = len(list(set(decoded))) / float(len(decoded))
-        rewards = reward_func(decoded, train_samples)
-        weights = np.array([pct_unique / float(decoded.count(sample))
-                            for sample in decoded])
+        # supervised pretraining for generator
+        g_predictions = tensor_array_ops.TensorArray(
+            dtype=tf.float32, size=self.sequence_length,
+            dynamic_size=False, infer_shape=True)
 
-        return rewards * weights
+        g_logits = tensor_array_ops.TensorArray(
+            dtype=tf.float32, size=self.sequence_length,
+            dynamic_size=False, infer_shape=True)
 
-    return batch_reward
+        ta_emb_x = tensor_array_ops.TensorArray(
+            dtype=tf.float32, size=self.sequence_length)
+        ta_emb_x = ta_emb_x.unstack(self.processed_x)
 
+        def _pretrain_recurrence(i, x_t, h_tm1, g_predictions, g_logits):
+            h_t = self.g_recurrent_unit(x_t, h_tm1)
+            o_t = self.g_output_unit(h_t)
+            g_predictions = g_predictions.write(i, tf.nn.softmax(o_t))  # batch x vocab_size
+            g_logits = g_logits.write(i, o_t)  # batch x vocab_size
+            x_tp1 = ta_emb_x.read(i)
+            return i + 1, x_tp1, h_t, g_predictions, g_logits
 
-def print_rewards(rewards):
-    print('Rewards be like...')
-    np.set_printoptions(precision=3, suppress=True)
-    print(rewards)
-    mean_r, std_r = np.mean(rewards), np.std(rewards)
-    min_r, max_r = np.min(rewards), np.max(rewards)
-    print('Mean: {:.3f} , Std:  {:.3f}'.format(mean_r, std_r),end='')
-    print(', Min: {:.3f} , Max:  {:.3f}\n'.format(min_r, max_r))
-    np.set_printoptions(precision=8, suppress=False)
-    return
-#=======================================
-##########################################################################
-train_samples = mm.load_train_data(params['TRAIN_FILE'])
-char_dict, ord_dict = mm.build_vocab(train_samples)
-NUM_EMB = len(char_dict)
-DATA_LENGTH = max(map(len, train_samples))
-MAX_LENGTH = params["MAX_LENGTH"]
-to_use = [sample for sample in train_samples if mm.verified_and_below(
-    sample, MAX_LENGTH)]
-positive_samples = [mm.encode(sample, MAX_LENGTH, char_dict)
-                    for sample in to_use]
-POSITIVE_NUM = len(positive_samples)
-print('Starting ObjectiveGAN for {:7s}'.format(PREFIX))
-print('Data points in train_file {:7d}'.format(len(train_samples)))
-print('Max data length is        {:7d}'.format(DATA_LENGTH))
-print('Max length to use is      {:7d}'.format(MAX_LENGTH))
-print('Avg length to use is      {:7f}'.format(
-    np.mean([len(s) for s in to_use])))
-print('Num valid data points is  {:7d}'.format(POSITIVE_NUM))
-print('Size of alphabet is       {:7d}'.format(NUM_EMB))
+        _, _, _, self.g_predictions, self.g_logits = control_flow_ops.while_loop(
+            cond=lambda i, _1, _2, _3, _4: i < self.sequence_length,
+            body=_pretrain_recurrence,
+            loop_vars=(tf.constant(0, dtype=tf.int32),
+                       tf.nn.embedding_lookup(self.g_embeddings, self.start_token),
+                       self.h0, g_predictions, g_logits))
 
+        self.g_predictions = tf.transpose(
+            self.g_predictions.stack(), perm=[1, 0, 2])  # batch_size x seq_length x vocab_size
 
-mm.print_params(params)
+        self.g_logits = tf.transpose(
+            self.g_logits.stack(), perm=[1, 0, 2])  # batch_size x seq_length x vocab_size
+        # pretraining loss
+        self.pretrain_loss = -tf.reduce_sum(
+            tf.one_hot(tf.to_int32(tf.reshape(self.x, [-1])), self.num_emb, 1.0, 0.0) * tf.log(
+                tf.clip_by_value(tf.reshape(self.g_predictions, [-1, self.num_emb]), 1e-20, 1.0)
+            )
+        ) / (self.sequence_length * self.batch_size)
 
+        # training updates
+        pretrain_opt = self.g_optimizer(self.learning_rate)
 
-##########################################################################
+        self.pretrain_grad, _ = tf.clip_by_global_norm(
+            tf.gradients(self.pretrain_loss, self.g_params), self.grad_clip)
+        self.pretrain_updates = pretrain_opt.apply_gradients(zip(self.pretrain_grad, self.g_params))
 
-class Generator(model.LSTM):
-
-    def g_optimizer(self, *args, **kwargs):
-        return tf.train.AdamOptimizer(0.002)  # ignore learning rate
-
-
-def generate_samples(sess, trainable_model, batch_size, generated_num, verbose=False):
-    #  Generated Samples
-    generated_samples = []
-    start = time.time()
-    for _ in range(int(generated_num / batch_size)):
-        generated_samples.extend(trainable_model.generate(sess))
-    end = time.time()
-    if verbose:
-        print('Sample generation time: %f' % (end - start))
-    return generated_samples
-
-
-def target_loss(sess, target_lstm, data_loader):
-    supervised_g_losses = []
-    data_loader.reset_pointer()
-
-    for it in range(data_loader.num_batch):
-        batch = data_loader.next_batch()
-        g_loss = sess.run(target_lstm.pretrain_loss, {target_lstm.x: batch})
-        supervised_g_losses.append(g_loss)
-
-    return np.mean(supervised_g_losses)
-
-
-def pre_train_epoch(sess, trainable_model, data_loader):
-    supervised_g_losses = []
-    data_loader.reset_pointer()
-
-    for it in range(data_loader.num_batch):
-        batch = data_loader.next_batch()
-        _, g_loss, g_pred = trainable_model.pretrain_step(sess, batch)
-        supervised_g_losses.append(g_loss)
-
-    return np.mean(supervised_g_losses)
-
-
-likelihood_data_loader = Gen_Data_loader(BATCH_SIZE)
-
-
-def pretrain(sess, generator, target_lstm, train_discriminator):
-    # samples = generate_samples(sess, target_lstm, BATCH_SIZE, generated_num)
-    gen_data_loader = Gen_Data_loader(BATCH_SIZE)
-    gen_data_loader.create_batches(positive_samples)
-    results = OrderedDict({'exp_name': PREFIX})
-
-    #  pre-train generator
-    print('Start pre-training...')
-    start = time.time()
-    for epoch in tqdm(range(PRE_EPOCH_NUM)):
-        print(' gen pre-train')
-        loss = pre_train_epoch(sess, generator, gen_data_loader)
-        if epoch == 10 or epoch % 40 == 0:
-            samples = generate_samples(sess, generator, BATCH_SIZE, SAMPLE_NUM)
-            likelihood_data_loader.create_batches(samples)
-            test_loss = target_loss(sess, target_lstm, likelihood_data_loader)
-            print('\t test_loss {}, train_loss {}'.format(test_loss, loss))
-            mm.compute_results(samples, train_samples, ord_dict, results)
-
-    samples = generate_samples(sess, generator, BATCH_SIZE, SAMPLE_NUM)
-    likelihood_data_loader.create_batches(samples)
-    test_loss = target_loss(sess, target_lstm, likelihood_data_loader)
-
-    samples = generate_samples(sess, generator, BATCH_SIZE, SAMPLE_NUM)
-    likelihood_data_loader.create_batches(samples)
-
-    print('Start training discriminator...')
-    for i in tqdm(range(dis_alter_epoch)):
-        print(' discriminator pre-train')
-        d_loss, acc = train_discriminator()
-    end = time.time()
-    print('Total time was {:.4f}s'.format(end - start))
-    return
-
-
-def save_results(sess, folder, name, results_rows=None):
-    if results_rows is not None:
-        df = pd.DataFrame(results_rows)
-        df.to_csv('{}_results.csv'.format(folder), index=False)
-    # save models
-    model_saver = tf.train.Saver()
-    ckpt_dir = os.path.join(params['CHK_PATH'], folder)
-    if not os.path.exists(ckpt_dir):
-        os.makedirs(ckpt_dir)
-    ckpt_file = os.path.join(ckpt_dir, '{}.ckpt'.format(name))
-    path = model_saver.save(sess, ckpt_file)
-    print('Model saved at {}'.format(path))
-    return
-
-
-def main():
-    random.seed(SEED)
-    np.random.seed(SEED)
-
-
-    vocab_size = NUM_EMB
-    dis_data_loader = Dis_dataloader()
-
-    best_score = 1000
-    generator = Generator(vocab_size, BATCH_SIZE, EMB_DIM,
-                          HIDDEN_DIM, MAX_LENGTH, START_TOKEN)
-    target_lstm = TARGET_LSTM(vocab_size, BATCH_SIZE,
-                              EMB_DIM, HIDDEN_DIM, MAX_LENGTH, 0)
-
-    with tf.variable_scope('discriminator'):
-        cnn = TextCNN(
-            sequence_length=MAX_LENGTH,
-            num_classes=2,
-            vocab_size=vocab_size,
-            embedding_size=dis_embedding_dim,
-            filter_sizes=dis_filter_sizes,
-            num_filters=dis_num_filters,
-            l2_reg_lambda=dis_l2_reg_lambda)
-
-    cnn_params = [param for param in tf.trainable_variables()
-                  if 'discriminator' in param.name]
-    # Define Discriminator Training procedure
-    dis_global_step = tf.Variable(0, name="global_step", trainable=False)
-    dis_optimizer = tf.train.AdamOptimizer(1e-4)
-    dis_grads_and_vars = dis_optimizer.compute_gradients(
-        cnn.loss, cnn_params, aggregation_method=2)
-    dis_train_op = dis_optimizer.apply_gradients(
-        dis_grads_and_vars, global_step=dis_global_step)
-
-    config = tf.ConfigProto()
-    # config.gpu_options.per_process_gpu_memory_fraction = 0.5
-    config.gpu_options.allow_growth = True
-    sess = tf.Session(config=config)
-
-    def train_discriminator():
-        if D_WEIGHT == 0:
-            return 0, 0
-
-        negative_samples = generate_samples(
-            sess, generator, BATCH_SIZE, POSITIVE_NUM)
-
-        #  train discriminator
-        dis_x_train, dis_y_train = dis_data_loader.load_train_data(
-            positive_samples, negative_samples)
-        dis_batches = dis_data_loader.batch_iter(
-            zip(dis_x_train, dis_y_train), dis_batch_size, dis_num_epochs
+        #######################################################################################################
+        #  Unsupervised Training
+        #######################################################################################################
+        self.g_loss = -tf.reduce_sum(
+            tf.reduce_sum(
+                tf.one_hot(tf.to_int32(tf.reshape(self.x, [-1])), self.num_emb, 1.0, 0.0) * tf.log(
+                    tf.clip_by_value(tf.reshape(self.g_predictions, [-1, self.num_emb]), 1e-20, 1.0)
+                ), 1) * tf.reshape(self.rewards, [-1])
         )
 
-        for batch in dis_batches:
-            x_batch, y_batch = zip(*batch)
-            feed = {
-                cnn.input_x: x_batch,
-                cnn.input_y: y_batch,
-                cnn.dropout_keep_prob: dis_dropout_keep_prob
-            }
-            _, step, loss, accuracy = sess.run(
-                [dis_train_op, dis_global_step, cnn.loss, cnn.accuracy], feed)
-        print('\tD loss  :   {}'.format(loss))
-        print('\tAccuracy: {}'.format(accuracy))
-        return loss, accuracy
+        g_opt = self.g_optimizer(self.learning_rate)
 
-    # Pretrain is checkpointed and only execcutes if we don't find a checkpoint
-    saver = tf.train.Saver()
-    ckpt_dir = 'checkpoints/{}_pretrain'.format(PREFIX)
-    if not os.path.exists(ckpt_dir):
-        os.makedirs(ckpt_dir)
-    ckpt_file = os.path.join(ckpt_dir, 'pretrain_ckpt')
-    if os.path.isfile(ckpt_file + '.meta') and params["LOAD_PRETRAIN"]:
-        saver.restore(sess, ckpt_file)
-        print('Pretrain loaded from previous checkpoint {}'.format(ckpt_file))
-    else:
-        if params["LOAD_PRETRAIN"]:
-            print('\t* No pre-training data found as {:s}.'.format(ckpt_file))
-        else:
-            print('\t* LOAD_PRETRAIN was set to false.')
+        self.g_grad, _ = tf.clip_by_global_norm(
+            tf.gradients(self.g_loss, self.g_params), self.grad_clip)
+        self.g_updates = g_opt.apply_gradients(zip(self.g_grad, self.g_params))
 
-        sess.run(tf.global_variables_initializer())
-        pretrain(sess, generator, target_lstm, train_discriminator)
-        path = saver.save(sess, ckpt_file)
-        print('Pretrain finished and saved at {}'.format(path))
+    def generate(self, session):
+        outputs = session.run([self.gen_x])
+        return outputs[0]
 
-    # create reward function
-    batch_reward = make_reward(train_samples)
+    def pretrain_step(self, session, x):
+        outputs = session.run([self.pretrain_updates, self.pretrain_loss, self.g_predictions],
+                              feed_dict={self.x: x})
+        return outputs
 
-    rollout = ROLLOUT(generator, 0.8)
+    def generator_step(self, sess, samples, rewards):
+        feed = {self.x: samples, self.rewards: rewards}
+        _, g_loss = sess.run([self.g_updates, self.g_loss], feed_dict=feed)
+        return g_loss
 
-    print('#########################################################################')
-    print('Start Reinforcement Training Generator...')
-    results_rows = []
-    for nbatch in tqdm(range(TOTAL_BATCH)):
-        results = OrderedDict({'exp_name': PREFIX})
-        if nbatch % 1 == 0 or nbatch == TOTAL_BATCH - 1:
-            print('* Making samples')
-            if nbatch % 10 == 0:
-                gen_samples = generate_samples(
-                    sess, generator, BATCH_SIZE, BIG_SAMPLE_NUM)
-            else:
-                gen_samples = generate_samples(
-                    sess, generator, BATCH_SIZE, SAMPLE_NUM)
-            likelihood_data_loader.create_batches(gen_samples)
-            test_loss = target_loss(sess, target_lstm, likelihood_data_loader)
-            print('batch_num: {}'.format(nbatch))
-            print('test_loss: {}'.format(test_loss))
-            results['Batch'] = nbatch
-            results['test_loss'] = test_loss
+    def init_matrix(self, shape):
+        return tf.random_normal(shape, stddev=0.1)
 
-            if test_loss < best_score:
-                best_score = test_loss
-                print('best score: %f' % test_loss)
+    def init_vector(self, shape):
+        return tf.zeros(shape)
 
-            # results
-            mm.compute_results(gen_samples, train_samples, ord_dict, results)
+    def create_recurrent_unit(self, params):
+        # Weights and Bias for input and hidden tensor
+        self.Wi = tf.Variable(self.init_matrix([self.emb_dim, self.hidden_dim]))
+        self.Ui = tf.Variable(self.init_matrix([self.emb_dim, self.hidden_dim]))
+        self.bi = tf.Variable(self.init_matrix([self.hidden_dim]))
 
-        print('#########################################################################')
-        print('-> Training generator with RL.')
-        print('G Epoch {}'.format(nbatch))
+        self.Wf = tf.Variable(self.init_matrix([self.emb_dim, self.hidden_dim]))
+        self.Uf = tf.Variable(self.init_matrix([self.hidden_dim, self.hidden_dim]))
+        self.bf = tf.Variable(self.init_matrix([self.hidden_dim]))
 
-        for it in range(TRAIN_ITER):
-            samples = generator.generate(sess)
-            rewards = rollout.get_reward(
-                sess, samples, 16, cnn, batch_reward, D_WEIGHT)
-            nll = generator.generator_step(sess, samples, rewards)
-            # results
-            print_rewards(rewards)
-            print('neg-loglike: {}'.format(nll))
-            results['neg-loglike'] = nll
-        rollout.update_params()
+        self.Wog = tf.Variable(self.init_matrix([self.emb_dim, self.hidden_dim]))
+        self.Uog = tf.Variable(self.init_matrix([self.hidden_dim, self.hidden_dim]))
+        self.bog = tf.Variable(self.init_matrix([self.hidden_dim]))
 
-        # generate for discriminator
-        print('-> Training Discriminator')
-        for i in range(D):
-            print('D_Epoch {}'.format(i))
-            d_loss, accuracy = train_discriminator()
-            results['D_loss_{}'.format(i)] = d_loss
-            results['Accuracy_{}'.format(i)] = accuracy
-        print('results')
-        results_rows.append(results)
-        if nbatch % params["EPOCH_SAVES"] == 0:
-            save_results(sess, PREFIX, PREFIX + '_model', results_rows)
+        self.Wc = tf.Variable(self.init_matrix([self.emb_dim, self.hidden_dim]))
+        self.Uc = tf.Variable(self.init_matrix([self.hidden_dim, self.hidden_dim]))
+        self.bc = tf.Variable(self.init_matrix([self.hidden_dim]))
+        params.extend([
+            self.Wi, self.Ui, self.bi,
+            self.Wf, self.Uf, self.bf,
+            self.Wog, self.Uog, self.bog,
+            self.Wc, self.Uc, self.bc])
 
-    # write results
-    save_results(sess, PREFIX, PREFIX + '_model', results_rows)
+        def unit(x, hidden_memory_tm1):
+            previous_hidden_state, c_prev = tf.unstack(hidden_memory_tm1)
 
-    print('\n:*** FINISHED ***')
-    return
+            # Input Gate
+            i = tf.sigmoid(
+                tf.matmul(x, self.Wi) +
+                tf.matmul(previous_hidden_state, self.Ui) + self.bi
+            )
 
-if __name__ == '__main__':
-    main()
+            # Forget Gate
+            f = tf.sigmoid(
+                tf.matmul(x, self.Wf) +
+                tf.matmul(previous_hidden_state, self.Uf) + self.bf
+            )
+
+            # Output Gate
+            o = tf.sigmoid(
+                tf.matmul(x, self.Wog) +
+                tf.matmul(previous_hidden_state, self.Uog) + self.bog
+            )
+
+            # New Memory Cell
+            c_ = tf.nn.tanh(
+                tf.matmul(x, self.Wc) +
+                tf.matmul(previous_hidden_state, self.Uc) + self.bc
+            )
+
+            # Final Memory cell
+            c = f * c_prev + i * c_
+
+            # Current Hidden state
+            current_hidden_state = o * tf.nn.tanh(c)
+
+            return tf.stack([current_hidden_state, c])
+
+        return unit
+
+    def create_output_unit(self, params):
+        self.Wo = tf.Variable(self.init_matrix([self.hidden_dim, self.num_emb]))
+        self.bo = tf.Variable(self.init_matrix([self.num_emb]))
+        params.extend([self.Wo, self.bo])
+
+        def unit(hidden_memory_tuple):
+            hidden_state, c_prev = tf.unstack(hidden_memory_tuple)
+            # hidden_state : batch x hidden_dim
+            logits = tf.matmul(hidden_state, self.Wo) + self.bo
+            # output = tf.nn.softmax(logits)
+            return logits
+
+        return unit
+
+    def g_optimizer(self, *args, **kwargs):
+        return tf.train.GradientDescentOptimizer(*args, **kwargs)
